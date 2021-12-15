@@ -20,21 +20,13 @@
  * TODO
  * Define global variables here.
  */
+extern num_to_gen;
 
 //gpu_mem ptrs for network, inputs, and outputs
 static int NETWORK_SIZE_IN_BYTES = 20549132;
 static float* gpu_network;
-/*
-Since there is no way to bring num_to_gen from main.c, 
-we need to calculate each input and output separately.
-(Not necessarily one at a time..)
-*/
-static float* gpu_input;  
-static float* gpu_output;
-static float* gpu_fm0;
-static float* gpu_fm1;
-static float* gpu_fm2;
-static float* gpu_fm3;
+static float* gpu_inputs;  
+static float* gpu_outputs;
 
 
 void facegen_init() {
@@ -44,20 +36,8 @@ void facegen_init() {
    * cudaMalloc(...)
    */
 	CHECK_CUDA(cudaMalloc(&gpu_network, NETWORK_SIZE_IN_BYTES * sizeof(float));
-	CHECK_CUDA(cudaMalloc(&gpu_input,100 * sizeof(float)));
-	CHECK_CUDA(cudaMalloc(&gpu_output,64*64*3 * sizeof(float)));
-
-  // intermediate buffer for feature maps
-	/*
-  float *fm0 = (float*)malloc(4 * 4 * 512 * sizeof(float));
-  float *fm1 = (float*)malloc(8 * 8 * 256 * sizeof(float));
-  float *fm2 = (float*)malloc(16 * 16 * 128 * sizeof(float));
-  float *fm3 = (float*)malloc(32 * 32 * 64 * sizeof(float));
-	*/
-	CHECK_CUDA(cudaMalloc(&gpu_fm0));
-	CHECK_CUDA(cudaMalloc(&gpu_fm1));
-	CHECK_CUDA(cudaMalloc(&gpu_fm2));
-	CHECK_CUDA(cudaMalloc(&gpu_fm3));
+	CHECK_CUDA(cudaMalloc(&gpu_input,num_to_gen * 100 * sizeof(float)));
+	CHECK_CUDA(cudaMalloc(&gpu_output,num_to_gen * 64*64*3 * sizeof(float)));
 }
 
 // data-parallelism w.r.t K (col. dim of output of proj)
@@ -97,7 +77,7 @@ __global__ void relu(float *inout, int HWC){
 	inout[hwc] = fmaxf(inout[hwc], 0);
 }
 
-__global__ void tconv(){
+__global__ void tconv(float *in, float *out, float *weight, float* bias, int H_IN, int W_IN, int C, int K){
 	
 }
 
@@ -163,12 +143,6 @@ void facegen_fin() {
    * Finalize required CUDA objects. For example,
    * cudaFree(...)
    */
-
-	CHECK_CUDA(cudaMalloc(&gpu_fm0));
-	CHECK_CUDA(cudaMalloc(&gpu_fm1));
-	CHECK_CUDA(cudaMalloc(&gpu_fm2));
-	CHECK_CUDA(cudaMalloc(&gpu_fm3));
-
 	CHECK_CUDA(gpu_network);
 	CHECK_CUDA(gpu_input);
 	CHECK_CUDA(gpu_output);
