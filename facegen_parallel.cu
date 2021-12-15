@@ -1,4 +1,8 @@
 #include <cuda_runtime.h>
+#include <math.h>
+#include <stdlib.h>
+#include <stdio.h>
+
 #include "facegen.h"
 
 
@@ -19,14 +23,18 @@
 
 //gpu_mem ptrs for network, inputs, and outputs
 static int NETWORK_SIZE_IN_BYTES = 20549132;
-static float* gpu_mem_network;
+static float* gpu_network;
 /*
 Since there is no way to bring num_to_gen from main.c, 
 we need to calculate each input and output separately.
 (Not necessarily one at a time..)
 */
-static float* gpu_mem_input;  
-static float* gpu_mem_output;
+static float* gpu_input;  
+static float* gpu_output;
+static float* gpu_fm0;
+static float* gpu_fm1;
+static float* gpu_fm2;
+static float* gpu_fm3;
 
 
 void facegen_init() {
@@ -35,9 +43,62 @@ void facegen_init() {
    * Initialize required CUDA objects. For example,
    * cudaMalloc(...)
    */
-	CHECK_CUDA(cudaMalloc(&gpu_mem_network, NETWORK_SIZE_IN_BYTES * sizeof(float));
-	CHECK_CUDA(cudaMalloc(&gpu_mem_input,100 * sizeof(float)));
-	CHECK_CUDA(cudaMalloc(&gpu_mem_output,64*64*3 * sizeof(float)));
+	CHECK_CUDA(cudaMalloc(&gpu_network, NETWORK_SIZE_IN_BYTES * sizeof(float));
+	CHECK_CUDA(cudaMalloc(&gpu_input,100 * sizeof(float)));
+	CHECK_CUDA(cudaMalloc(&gpu_output,64*64*3 * sizeof(float)));
+
+  // intermediate buffer for feature maps
+	/*
+  float *fm0 = (float*)malloc(4 * 4 * 512 * sizeof(float));
+  float *fm1 = (float*)malloc(8 * 8 * 256 * sizeof(float));
+  float *fm2 = (float*)malloc(16 * 16 * 128 * sizeof(float));
+  float *fm3 = (float*)malloc(32 * 32 * 64 * sizeof(float));
+	*/
+	CHECK_CUDA(cudaMalloc(&gpu_fm0));
+	CHECK_CUDA(cudaMalloc(&gpu_fm1));
+	CHECK_CUDA(cudaMalloc(&gpu_fm2));
+	CHECK_CUDA(cudaMalloc(&gpu_fm3));
+}
+
+// data-parallelism w.r.t K (col. dim of output of proj)
+__global__ void proj(float *in, float *out, float *weight, float *bias, int C, K){
+	int k = blockDim.x * blockIdx.x + threadIdx.x;
+	if (k >= K) return;
+	
+	float s = 0;
+	for (int c = 0; c<C; c++){
+		s += in[c] * weight[c]
+	}
+	s += bias[k];
+	out[k] = s;
+}
+
+__global__ void batch_norm(float *inout, float *beta, float *gamma, float *mean, float *var, int HW, int C){		
+	int hw = blockDim.x * blockIdx.x + threadIdx.x;
+	if (hw >= HW) return;
+	
+	for (int c = 0; c < C; c++){
+		float scaled_gamma = gamma[c] / sqrtf(var[c] + 1e-5);
+		inout[hw * C + c] = scaled_gammma * inout[hw * C + c] + (beta[c] - scaled_gammma * mean[c]);
+	}
+}
+
+__global__ void tanh_layer(float *inout, int HWC){
+	int hwc = blockDim.x * blockIdx.x + threadIdx.x;
+	if (hwc >= HWC) return;
+
+	inout[hwc] = tanhf(inout[hwc]);
+}
+
+__global__ void relu(float *inout, int HWC){
+	int hwc = blockDim.x * blockIdx.x + threadIdx.x;
+	if (hwc >= HWC) return;
+
+	inout[hwc] = fmaxf(inout[hwc], 0);
+}
+
+__global__ void tconv(){
+	
 }
 
 
@@ -52,38 +113,46 @@ void facegen(int num_to_gen, float *network, float *inputs, float *outputs) {
    * CUDA kernel launch,
    * Device-to-host memory copy
    */
-	float *proj_w = network; network += 100 * 8192;
-  float *proj_b = network; network += 8192;
-  float *bn0_beta = network; network += 512;
-  float *bn0_gamma = network; network += 512;
-  float *bn0_mean = network; network += 512;
-  float *bn0_var = network; network += 512;
-  float *tconv1_w = network; network += 5 * 5 * 256 * 512;
-  float *tconv1_b = network; network += 256;
-  float *bn1_beta = network; network += 256;
-  float *bn1_gamma = network; network += 256;
-  float *bn1_mean = network; network += 256;
-  float *bn1_var = network; network += 256;
-  float *tconv2_w = network; network += 5 * 5 * 128 * 256;
-  float *tconv2_b = network; network += 128;
-  float *bn2_beta = network; network += 128;
-  float *bn2_gamma = network; network += 128;
-  float *bn2_mean = network; network += 128;
-  float *bn2_var = network; network += 128;
-  float *tconv3_w = network; network += 5 * 5 * 64 * 128;
-  float *tconv3_b = network; network += 64;
-  float *bn3_beta = network; network += 64;
-  float *bn3_gamma = network; network += 64;
-  float *bn3_mean = network; network += 64;
-  float *bn3_var = network; network += 64;
-  float *tconv4_w = network; network += 5 * 5 * 3 * 64;
-  float *tconv4_b = network; network += 3;
+	float *proj_w = gpu_network; gpu_network += 100 * 8192;
+  float *proj_b = gpu_network; gpu_network += 8192;
+  float *bn0_beta = gpu_network; gpu_network += 512;
+  float *bn0_gamma = gpu_network; gpu_network += 512;
+  float *bn0_mean = gpu_network; gpu_network += 512;
+  float *bn0_var = gpu_network; gpu_network += 512;
+  float *tconv1_w = gpu_network; gpu_network += 5 * 5 * 256 * 512;
+  float *tconv1_b = gpu_network; gpu_network += 256;
+  float *bn1_beta = gpu_network; gpu_network += 256;
+  float *bn1_gamma = gpu_network; gpu_network += 256;
+  float *bn1_mean = gpu_network; gpu_network += 256;
+  float *bn1_var = gpu_network; gpu_network += 256;
+  float *tconv2_w = gpu_network; gpu_network += 5 * 5 * 128 * 256;
+  float *tconv2_b = gpu_network; gpu_network += 128;
+  float *bn2_beta = gpu_network; gpu_network += 128;
+  float *bn2_gamma = gpu_network; gpu_network += 128;
+  float *bn2_mean = gpu_network; gpu_network += 128;
+  float *bn2_var = gpu_network; gpu_network += 128;
+  float *tconv3_w = gpu_network; gpu_network += 5 * 5 * 64 * 128;
+  float *tconv3_b = gpu_network; gpu_network += 64;
+  float *bn3_beta = gpu_network; gpu_network += 64;
+  float *bn3_gamma = gpu_network; gpu_network += 64;
+  float *bn3_mean = gpu_network; gpu_network += 64;
+  float *bn3_var = gpu_network; gpu_network += 64;
+  float *tconv4_w = gpu_network; gpu_network += 5 * 5 * 3 * 64;
+  float *tconv4_b = gpu_network; gpu_network += 3;
+	
+	for (int n = 0; n < num_to_gen; n++){
+		
+		/* Add MPI_Send, MPI_Recv here*/ 
 
-  // intermediate buffer for feature maps
-  float *fm0 = (float*)malloc(4 * 4 * 512 * sizeof(float));
-  float *fm1 = (float*)malloc(8 * 8 * 256 * sizeof(float));
-  float *fm2 = (float*)malloc(16 * 16 * 128 * sizeof(float));
-  float *fm3 = (float*)malloc(32 * 32 * 64 * sizeof(float));
+		// Linear projection layer
+		dim3 gridDim();
+		dim3 blockDim();
+		proj<<<>>>(gpu_input, gpu_fm0, proj_w, proj_b, 100, 8192);
+		batch_norm<<<>>>(gpu_input, gpu_fm0, proj_w, proj_b, 100, 8192);
+		relu<<<>>>(gpu_input, gpu_fm0, proj_w, proj_b, 100, 8192);
+
+		
+	}
 
 
 }
@@ -94,8 +163,14 @@ void facegen_fin() {
    * Finalize required CUDA objects. For example,
    * cudaFree(...)
    */
-	CHECK_CUDA(gpu_mem_network);
-	CHECK_CUDA(gpu_mem_input);
-	CHECK_CUDA(gpu_mem_output);
+
+	CHECK_CUDA(cudaMalloc(&gpu_fm0));
+	CHECK_CUDA(cudaMalloc(&gpu_fm1));
+	CHECK_CUDA(cudaMalloc(&gpu_fm2));
+	CHECK_CUDA(cudaMalloc(&gpu_fm3));
+
+	CHECK_CUDA(gpu_network);
+	CHECK_CUDA(gpu_input);
+	CHECK_CUDA(gpu_output);
 
 }
