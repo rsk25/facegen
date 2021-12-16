@@ -24,10 +24,15 @@ extern num_to_gen;
 
 //gpu_mem ptrs for network, inputs, and outputs
 static int NETWORK_SIZE_IN_BYTES = 20549132;
+
 static float* gpu_network;
 static float* gpu_inputs;  
 static float* gpu_outputs;
 
+static float* gpu_fm0;
+static float* gpu_fm1;
+static float* gpu_fm2;
+static float* gpu_fm3;
 
 void facegen_init() {
   /*
@@ -38,6 +43,13 @@ void facegen_init() {
 	CHECK_CUDA(cudaMalloc(&gpu_network, NETWORK_SIZE_IN_BYTES * sizeof(float));
 	CHECK_CUDA(cudaMalloc(&gpu_input,num_to_gen * 100 * sizeof(float)));
 	CHECK_CUDA(cudaMalloc(&gpu_output,num_to_gen * 64*64*3 * sizeof(float)));
+
+	CHECK_CUDA(cudaMalloc(&gpu_fm0, 4 * 4 * 512 * sizeof(float);
+	CHECK_CUDA(cudaMalloc(&gpu_fm0, 8 * 8 * 256 * sizeof(float);
+	CHECK_CUDA(cudaMalloc(&gpu_fm0, 16 * 16 * 128 * sizeof(float);
+	CHECK_CUDA(cudaMalloc(&gpu_fm0, 32 * 32 * 64 * sizeof(float);
+		
+	CHECK_CUDA(cudaDeviceSynchronize());
 }
 
 // data-parallelism w.r.t K (col. dim of output of proj)
@@ -155,17 +167,33 @@ void facegen(int num_to_gen, float *network, float *inputs, float *outputs) {
 		
 		/* Add MPI_Send, MPI_Recv here*/ 
 
-		// Linear projection layer
 		dim3 gridDim();
 		dim3 blockDim();
-		proj<<<>>>(gpu_input, gpu_fm0, proj_w, proj_b, 100, 8192);
-		batch_norm<<<>>>(gpu_input, gpu_fm0, proj_w, proj_b, 100, 8192);
-		relu<<<>>>(gpu_input, gpu_fm0, proj_w, proj_b, 100, 8192);
+		proj<<<>>>(input, fm0, proj_w, proj_b, 100, 8192);
+    // implicit layout change here; (8192,) -> (4, 4, 512)
+    batch_norm<<<>>>(fm0, bn0_beta, bn0_gamma, bn0_mean, bn0_var, 4 * 4, 512);
+    relu<<<>>>(fm0, 4 * 4 * 512);
+		CHECK_CUDA(cudaDeviceSynchronize());
 
-		
-	}
+    tconv<<<>>>(fm0, fm1, tconv1_w, tconv1_b, 4, 4, 512, 256);
+    batch_norm<<<>>>(fm1, bn1_beta, bn1_gamma, bn1_mean, bn1_var, 8 * 8, 256);
+    relu<<<>>>(fm1, 8 * 8 * 256);
+		CHECK_CUDA(cudaDeviceSynchronize());
 
+    tconv<<<>>>(fm1, fm2, tconv2_w, tconv2_b, 8, 8, 256, 128);
+    batch_norm<<<>>>(fm2, bn2_beta, bn2_gamma, bn2_mean, bn2_var, 16 * 16, 128);
+    relu<<<>>>(fm2, 16 * 16 * 128);
+		CHECK_CUDA(cudaDeviceSynchronize());
 
+    tconv<<<>>>(fm2, fm3, tconv3_w, tconv3_b, 16, 16, 128, 64);
+    batch_norm<<<>>>(fm3, bn3_beta, bn3_gamma, bn3_mean, bn3_var, 32 * 32, 64);
+    relu<<<>>>(fm3, 32 * 32 * 64);
+		CHECK_CUDA(cudaDeviceSynchronize());
+
+    tconv<<<>>>(fm3, output, tconv4_w, tconv4_b, 32, 32, 64, 3);
+    tanh_layer<<<>>>(output, 64 * 64 * 3);
+		CHECK_CUDA(cudaDeviceSynchronize());
+  }
 }
 
 void facegen_fin() {
@@ -177,5 +205,10 @@ void facegen_fin() {
 	CHECK_CUDA(gpu_network);
 	CHECK_CUDA(gpu_input);
 	CHECK_CUDA(gpu_output);
+
+	CHECK_CUDA(gpu_fm0);
+	CHECK_CUDA(gpu_fm1);
+	CHECK_CUDA(gpu_fm2);
+	CHECK_CUDA(gpu_fm3);
 
 }
