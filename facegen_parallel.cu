@@ -78,7 +78,38 @@ __global__ void relu(float *inout, int HWC){
 }
 
 __global__ void tconv(float *in, float *out, float *weight, float* bias, int H_IN, int W_IN, int C, int K){
+	int k = blockDim.x * blockIdx.x + threadIdx.x;
+	if (k >= K) return;
 	
+	for (int h_out = 0; h_out < H_OUT; ++h_out) {
+    for (int w_out = 0; w_out < W_OUT; ++w_out) {
+			float ss = 0;
+			for (int r = 0; r < 5; ++r) {
+				for (int s = 0; s < 5; ++s) {
+					// top and left side has padding 3, bottom and right side has padding 2
+					// so subtract 3
+					int h_in = h_out - 3 + r;
+					int w_in = w_out - 3 + s;
+					// stride is 2, so check coordinates fall into input element or empty space
+					if (h_in % 2 == 0 && w_in % 2 == 0) {
+						h_in /= 2;
+						w_in /= 2;
+						// boundary check
+						if (0 <= h_in && h_in < H_IN && 0 <= w_in && w_in < W_IN) {
+							for (int c = 0; c < C; ++c) {
+								// filter is stored in reverse; so use [4 - r][4 - s] instead of [r][s]
+								// ss += in[h_in][w_in][c] * weight[4 - r][4 - s][k][c];
+								ss += in[(h_in * W_IN + w_in) * C + c] * weight[(((4 - r) * 5 + (4 - s)) * K + k) * C + c];
+							}
+						}
+					}
+				}
+			}
+			ss += bias[k];
+			// out[h_out][w_out][k] = ss;
+			out[(h_out * W_OUT + w_out) * K + k] = ss;
+		}
+	}
 }
 
 
