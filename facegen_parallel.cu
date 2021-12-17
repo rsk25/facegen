@@ -61,7 +61,7 @@ __global__ void proj(float *in, float *out, float *weight, float *bias, int C, K
 	
 	float s = 0;
 	for (int c = 0; c<C; c++){
-		s += in[c] * weight[c]
+		s += in[c] * weight[c];
 	}
 	s += bias[k];
 	out[k] = s;
