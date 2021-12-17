@@ -173,8 +173,8 @@ void facegen(int num_to_gen, float *network, float *inputs, float *outputs) {
 		
 	/* Add MPI_Send, MPI_Recv here*/ 
 
-	dim3 gridDim(64,0,0);
-	dim3 blockDim(128,0,0);
+	dim3 gridDim(64,1,1);
+	dim3 blockDim(128,1,1);
 
 	for (int n = 0; n < num_to_gen; n++){
 		
