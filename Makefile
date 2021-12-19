@@ -21,3 +21,7 @@ facegen_parallel.o: facegen_parallel.cu
 
 clean:
 	rm -rf facegen_seq facegen_parallel $(OBJECTS) facegen_seq.o facegen_parallel.o
+
+test:
+	salloc --nodes=1 --ntasks-per-node=1 --cpus-per-task=2 --partition=shpc mpirun ./facegen_seq network.bin input1.txt	output1.txt output1.bmp
+	salloc --nodes=1 --ntasks-per-node=1 --cpus-per-task=64 --gres=gpu:4 --partition=shpc mpirun ./facegen_parallel network.bin input1.txt output1.txt output1.bmp

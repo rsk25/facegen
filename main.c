@@ -7,6 +7,7 @@
 #include "facegen.h"
 
 const int NETWORK_SIZE_IN_BYTES = 20549132;
+int num_to_gen;
 
 // read network binary
 float* read_network(char *fn) {
@@ -105,8 +106,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, " e.g., %s network.bin input1.txt output1.txt output1.bmp\n", argv[0]);
         exit(EXIT_FAILURE);
     }
-
-    int num_to_gen;
+		
     float *network = read_network(argv[1]);
     float *inputs = read_inputs(argv[2], &num_to_gen);
     float *outputs = (float*)malloc(num_to_gen * 64 * 64 * 3 * sizeof(float));

@@ -20,12 +20,12 @@
  * TODO
  * Define global variables here.
  */
-extern num_to_gen;
-extern NETWORK_SIZE_IN_BYTE;
+static int NETWORK_SIZE_IN_BYTES = 20549132;
+extern int num_to_gen;
 
 //gpu_mem ptrs for network, inputs, and outputs
 
-static float* gpu_network;
+static float* gpu_network_full;
 static float* gpu_inputs;  
 static float* gpu_outputs;
 
@@ -41,9 +41,9 @@ void facegen_init()
    * Initialize required CUDA objects. For example,
    * cudaMalloc(...)
    */
-	CHECK_CUDA(cudaMalloc(&gpu_network, NETWORK_SIZE_IN_BYTES * sizeof(float));
-	CHECK_CUDA(cudaMalloc(&gpu_inputs,num_to_gen * 100 * sizeof(float)));
-	CHECK_CUDA(cudaMalloc(&gpu_outputs,num_to_gen * 64*64*3 * sizeof(float)));
+	CHECK_CUDA(cudaMalloc((void **)&gpu_network_full, NETWORK_SIZE_IN_BYTES));
+	CHECK_CUDA(cudaMalloc(&gpu_inputs, num_to_gen * 100 * sizeof(float)));
+	CHECK_CUDA(cudaMalloc(&gpu_outputs, num_to_gen * 64 * 64 * 3 * sizeof(float)));
 
 	CHECK_CUDA(cudaMalloc(&gpu_fm0, 4 * 4 * 512 * sizeof(float)));
 	CHECK_CUDA(cudaMalloc(&gpu_fm1, 8 * 8 * 256 * sizeof(float)));
@@ -54,17 +54,18 @@ void facegen_init()
 }
 
 // data-parallelism w.r.t K (col. dim of output of proj)
-__global__ void proj(float *in, float *out, float *weight, float *bias, int C, K)
+__global__ void proj(float *in, float *out, float *weight, float *bias, int C, int K)
 {
 	int k = blockDim.x * blockIdx.x + threadIdx.x;
 	if (k >= K) return;
 	
 	float s = 0;
-	for (int c = 0; c<C; c++){
-		s += in[c] * weight[c];
+	for (int c = 0; c < C; c++){
+		s += in[c] * weight[c * K + k];
 	}
 	s += bias[k];
 	out[k] = s;
+	if (k == 0) printf("proj result: %f\n", out[k]);
 }
 
 __global__ void batch_norm(float *inout, float *beta, float *gamma, float *mean, float *var, int HW, int C){		
@@ -73,7 +74,7 @@ __global__ void batch_norm(float *inout, float *beta, float *gamma, float *mean,
 	
 	for (int c = 0; c < C; c++){
 		float scaled_gamma = gamma[c] / sqrtf(var[c] + 1e-5);
-		inout[hw * C + c] = scaled_gammma * inout[hw * C + c] + (beta[c] - scaled_gammma * mean[c]);
+		inout[hw * C + c] = scaled_gamma * inout[hw * C + c] + (beta[c] - scaled_gamma * mean[c]);
 	}
 }
 
@@ -92,11 +93,13 @@ __global__ void relu(float *inout, int HWC){
 }
 
 __global__ void tconv(float *in, float *out, float *weight, float* bias, int H_IN, int W_IN, int C, int K){
-	int k = blockDim.x * blockIdx.x + threadIdx.x;
-	if (k >= K) return;
-	
-	for (int h_out = 0; h_out < H_OUT; ++h_out) {
-    for (int w_out = 0; w_out < W_OUT; ++w_out) {
+	int h_out = blockDim.x * blockIdx.x + threadIdx.x;
+	if (h_out >= H_IN*2) return;
+
+	//int H_OUT = H_IN * 2;
+ 	int W_OUT = W_IN * 2;
+	for (int w_out = 0; w_out < W_OUT; ++w_out) {
+		for (int k = 0; k < K; k++){
 			float ss = 0;
 			for (int r = 0; r < 5; ++r) {
 				for (int s = 0; s < 5; ++s) {
@@ -138,10 +141,11 @@ void facegen(int num_to_gen, float *network, float *inputs, float *outputs) {
    * CUDA kernel launch,
    * Device-to-host memory copy
    */
-	
-	CHECK_CUDA(cudaMemcpy(gpu_network, network, NETWORK_SIZE_IN_BYTES, cudaMemcpyHostToDevice));
-	CHECK_CUDA(cudaMemcpy(gpu_inputs, inputs, num_to_gen * 10 * sizeof(float), cudaMemcpyHostToDevice));
+
+	CHECK_CUDA(cudaMemcpy(gpu_network_full, network, NETWORK_SIZE_IN_BYTES, cudaMemcpyHostToDevice));
+	CHECK_CUDA(cudaMemcpy(gpu_inputs, inputs, num_to_gen * 100 * sizeof(float), cudaMemcpyHostToDevice));
 	CHECK_CUDA(cudaMemcpy(gpu_outputs, outputs, num_to_gen * 64 * 64 * 3 * sizeof(float), cudaMemcpyHostToDevice));
+	float* gpu_network = gpu_network_full;
 
 	float *proj_w = gpu_network; gpu_network += 100 * 8192;
   float *proj_b = gpu_network; gpu_network += 8192;
@@ -170,44 +174,40 @@ void facegen(int num_to_gen, float *network, float *inputs, float *outputs) {
   float *tconv4_w = gpu_network; gpu_network += 5 * 5 * 3 * 64;
   float *tconv4_b = gpu_network; gpu_network += 3;
 	
-		
 	/* Add MPI_Send, MPI_Recv here*/ 
 
-	dim3 gridDim(64,1,1);
-	dim3 blockDim(128,1,1);
+	dim3 gridDim(64);
+	dim3 blockDim(64);
 
 	for (int n = 0; n < num_to_gen; n++){
 		
-		float *gpu_inputs = inputs + n * 100;
-		float *gpu_outputs = outputs + n * 64 * 64 * 3;
+		float *input = &gpu_inputs[n * 100];
+		float *output = &gpu_outputs[n * 64 * 64 * 3];
 		proj<<<gridDim, blockDim>>>(input, gpu_fm0, proj_w, proj_b, 100, 8192);
-		// implicit layout change here; (8192,) -> (4, 4, 512)
 		batch_norm<<<gridDim, blockDim>>>(gpu_fm0, bn0_beta, bn0_gamma, bn0_mean, bn0_var, 4 * 4, 512);
 		relu<<<gridDim, blockDim>>>(gpu_fm0, 4 * 4 * 512);
-		CHECK_CUDA(cudaDeviceSynchronize());
 
 		tconv<<<gridDim, blockDim>>>(gpu_fm0, gpu_fm1, tconv1_w, tconv1_b, 4, 4, 512, 256);
 		batch_norm<<<gridDim, blockDim>>>(gpu_fm1, bn1_beta, bn1_gamma, bn1_mean, bn1_var, 8 * 8, 256);
 		relu<<<gridDim, blockDim>>>(gpu_fm1, 8 * 8 * 256);
-		CHECK_CUDA(cudaDeviceSynchronize());
 
 		tconv<<<gridDim, blockDim>>>(gpu_fm1, gpu_fm2, tconv2_w, tconv2_b, 8, 8, 256, 128);
 		batch_norm<<<gridDim, blockDim>>>(gpu_fm2, bn2_beta, bn2_gamma, bn2_mean, bn2_var, 16 * 16, 128);
 		relu<<<gridDim, blockDim>>>(gpu_fm2, 16 * 16 * 128);
-		CHECK_CUDA(cudaDeviceSynchronize());
 
 		tconv<<<gridDim, blockDim>>>(gpu_fm2, gpu_fm3, tconv3_w, tconv3_b, 16, 16, 128, 64);
 		batch_norm<<<gridDim, blockDim>>>(gpu_fm3, bn3_beta, bn3_gamma, bn3_mean, bn3_var, 32 * 32, 64);
 		relu<<<gridDim, blockDim>>>(gpu_fm3, 32 * 32 * 64);
-		CHECK_CUDA(cudaDeviceSynchronize());
 
 		tconv<<<gridDim, blockDim>>>(gpu_fm3, output, tconv4_w, tconv4_b, 32, 32, 64, 3);
+		CHECK_CUDA(cudaDeviceSynchronize());
 		tanh_layer<<<gridDim, blockDim>>>(output, 64 * 64 * 3);
 		CHECK_CUDA(cudaDeviceSynchronize());
 
 	}
 	CHECK_CUDA(cudaMemcpy(outputs, gpu_outputs, num_to_gen * 64 * 64 * 3 * sizeof(float), cudaMemcpyDeviceToHost));
 	CHECK_CUDA(cudaDeviceSynchronize());
+	
 }
 
 void facegen_fin() {
@@ -216,7 +216,7 @@ void facegen_fin() {
    * Finalize required CUDA objects. For example,
    * cudaFree(...)
    */
-	CHECK_CUDA(cudaFree(gpu_network));
+	CHECK_CUDA(cudaFree(gpu_network_full));
 	CHECK_CUDA(cudaFree(gpu_inputs));
 	CHECK_CUDA(cudaFree(gpu_outputs));
 
