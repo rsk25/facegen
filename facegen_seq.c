@@ -19,7 +19,6 @@ static void proj(float *in, float *out, float *weight, float *bias, int C, int K
     }
     s += bias[k];
     out[k] = s;
-		if (k == 0) printf("proj result: %f\n", out[k]);
   }
 }
 

@@ -65,7 +65,6 @@ __global__ void proj(float *in, float *out, float *weight, float *bias, int C, i
 	}
 	s += bias[k];
 	out[k] = s;
-	if (k == 0) printf("proj result: %f\n", out[k]);
 }
 
 __global__ void batch_norm(float *inout, float *beta, float *gamma, float *mean, float *var, int HW, int C){		
@@ -93,16 +92,16 @@ __global__ void relu(float *inout, int HWC){
 }
 
 __global__ void tconv(float *in, float *out, float *weight, float* bias, int H_IN, int W_IN, int C, int K){
-	int h_out = blockDim.x * blockIdx.x + threadIdx.x;
-	if (h_out >= H_IN*2) return;
+	int k = blockDim.x * blockIdx.x + threadIdx.x;
+	if (k >= K) return;
 
-	//int H_OUT = H_IN * 2;
+	int H_OUT = H_IN * 2;
  	int W_OUT = W_IN * 2;
-	for (int w_out = 0; w_out < W_OUT; ++w_out) {
-		for (int k = 0; k < K; k++){
+	for (int h_out = 0; h_out < H_OUT; h_out++) {
+		for (int w_out = 0; w_out < W_OUT; w_out++) {
 			float ss = 0;
-			for (int r = 0; r < 5; ++r) {
-				for (int s = 0; s < 5; ++s) {
+			for (int r = 0; r < 5; r++) {
+				for (int s = 0; s < 5; s++) {
 					// top and left side has padding 3, bottom and right side has padding 2
 					// so subtract 3
 					int h_in = h_out - 3 + r;
@@ -113,7 +112,7 @@ __global__ void tconv(float *in, float *out, float *weight, float* bias, int H_I
 						w_in /= 2;
 						// boundary check
 						if (0 <= h_in && h_in < H_IN && 0 <= w_in && w_in < W_IN) {
-							for (int c = 0; c < C; ++c) {
+							for (int c = 0; c < C; c++) {
 								// filter is stored in reverse; so use [4 - r][4 - s] instead of [r][s]
 								// ss += in[h_in][w_in][c] * weight[4 - r][4 - s][k][c];
 								ss += in[(h_in * W_IN + w_in) * C + c] * weight[(((4 - r) * 5 + (4 - s)) * K + k) * C + c];
@@ -176,7 +175,7 @@ void facegen(int num_to_gen, float *network, float *inputs, float *outputs) {
 	
 	/* Add MPI_Send, MPI_Recv here*/ 
 
-	dim3 gridDim(64);
+	dim3 gridDim(NETWORK_SIZE_IN_BYTES/64);
 	dim3 blockDim(64);
 
 	for (int n = 0; n < num_to_gen; n++){
@@ -200,7 +199,6 @@ void facegen(int num_to_gen, float *network, float *inputs, float *outputs) {
 		relu<<<gridDim, blockDim>>>(gpu_fm3, 32 * 32 * 64);
 
 		tconv<<<gridDim, blockDim>>>(gpu_fm3, output, tconv4_w, tconv4_b, 32, 32, 64, 3);
-		CHECK_CUDA(cudaDeviceSynchronize());
 		tanh_layer<<<gridDim, blockDim>>>(output, 64 * 64 * 3);
 		CHECK_CUDA(cudaDeviceSynchronize());
 
