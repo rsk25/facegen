@@ -59,16 +59,20 @@ void facegen_init(){
 
 	int num_of_device;
 	cudaGetDeviceCount(&num_of_device);
-	cudaSetDevice(mpi_rank % num_of_device);
+	cudaSetDevice(mpi_rank % 4);
 
 	nodeStatus = (MPI_Status *)malloc(mpi_size * sizeof(MPI_Status));
 	nodeRequests = (MPI_Request *)malloc(mpi_size * sizeof(MPI_Request));
 
-	CHECK_CUDA(cudaMalloc((void **)&gpu_network_full, NETWORK_SIZE_IN_BYTES));
+	if (mpi_rank == 0){
+		per_node_size = num_to_gen - ((mpi_size - 1) * per_node_size);
+	}
+
+	CHECK_CUDA(cudaMalloc(&gpu_network_full, NETWORK_SIZE_IN_BYTES));
 	// double buffering
 	for (int i = 0; i < 2; i++) {
-		CHECK_CUDA(cudaMallocHost(&gpu_inputs[i], 100 * sizeof(float)));
-		CHECK_CUDA(cudaMallocHost(&gpu_outputs[i], 64 * 64 * 3 * sizeof(float)));
+		CHECK_CUDA(cudaMalloc(&gpu_inputs[i], 100 * sizeof(float)));
+		CHECK_CUDA(cudaMalloc(&gpu_outputs[i], 64 * 64 * 3 * sizeof(float)));
 	}
 	CHECK_CUDA(cudaMalloc(&gpu_fm0, 4 * 4 * 512 * sizeof(float)));
 	CHECK_CUDA(cudaMalloc(&gpu_fm1, 8 * 8 * 256 * sizeof(float)));
@@ -171,19 +175,20 @@ void facegen(int num_to_gen, float *network, float *inputs, float *outputs) {
    * Device-to-host memory copy
    */
 
-	int offset = 100 * per_node_size;
 	if (mpi_rank == 0){
+		int offset = 100 * (num_to_gen / mpi_size);
 		float* nodeInputs = inputs + 100 * per_node_size;
-		for (int i = 0; i < mpi_size-1; i++){
+		for (int i = 1; i < mpi_size; i++){
 			MPI_Isend(network, NETWORK_SIZE_IN_BYTES / sizeof(float), MPI_FLOAT, i, tag, MPI_COMM_WORLD, &request);
-			MPI_Isend(nodeInputs + i*offset, offset, MPI_FLOAT, i, tag, MPI_COMM_WORLD, &request);
+			MPI_Isend(nodeInputs + (i-1)*offset, offset, MPI_FLOAT, i, tag, MPI_COMM_WORLD, &request);
 			MPI_Wait(&request, &status);
 		}
 	} else {
-		for (int i = 0; i < mpi_size-1; i++){
-			MPI_Irecv(network, NETWORK_SIZE_IN_BYTES / sizeof(float), MPI_FLOAT, 0, tag, MPI_COMM_WORLD, &nodeRequests[i+1]);
-			MPI_Irecv(inputs, offset, MPI_FLOAT, 0, tag, MPI_COMM_WORLD, &nodeRequests[i+1]);
-			MPI_Wait(&nodRequests[i+1], &nodeStatus[i+1]);
+		int offset = 100 * (num_to_gen / mpi_size);
+		for (int i = 1; i < mpi_size; i++){
+			MPI_Irecv(network, NETWORK_SIZE_IN_BYTES / sizeof(float), MPI_FLOAT, 0, tag, MPI_COMM_WORLD, &nodeRequests[i]);
+			MPI_Irecv(inputs, offset, MPI_FLOAT, 0, tag, MPI_COMM_WORLD, &nodeRequests[i]);
+			MPI_Wait(&nodeRequests[i], &nodeStatus[i]);
 		}
 	}
 
@@ -226,10 +231,10 @@ void facegen(int num_to_gen, float *network, float *inputs, float *outputs) {
 	for (int n = 0; n < per_node_size; n++){
 		
 		// per each buffer
-		int idx = n % 2
-		float *input = &gpu_inputs[idx];
-		float *output = &gpu_outputs[idx];
-		CHECK_CUDA(cudaMemcpyAsync(gpu_inputs[idx], &inputs[n * 100], 100 * sizeof(float), cudaMemcpyHostToDevice, stream[idx]);
+		int idx = n % 2;
+		float *input = gpu_inputs[idx];
+		float *output = gpu_outputs[idx];
+		CHECK_CUDA(cudaMemcpyAsync(gpu_inputs[idx], &inputs[n * 100], 100 * sizeof(float), cudaMemcpyHostToDevice, stream[idx]));
 
 		proj<<<gridDim, blockDim, 0, stream[idx]>>>(input, gpu_fm0, proj_w, proj_b, 100, 8192);
 		batch_norm<<<gridDim, blockDim, 0, stream[idx]>>>(gpu_fm0, bn0_beta, bn0_gamma, bn0_mean, bn0_var, 4 * 4, 512);
@@ -251,7 +256,7 @@ void facegen(int num_to_gen, float *network, float *inputs, float *outputs) {
 		tanh_layer<<<gridDim, blockDim, 0, stream[idx]>>>(output, 64 * 64 * 3);
 		CHECK_CUDA(cudaDeviceSynchronize());
 
-		CHECK_CUDA(cudaMemcpyAsync(&outputs[n * 64 * 64 * 3], &gpu_outputs[idx], 64 * 64 * 3 * sizeof(float), cudaMemcpyDeviceToHost, stream[idx]));
+		CHECK_CUDA(cudaMemcpyAsync(&outputs[n * 64 * 64 * 3], gpu_outputs[idx], 64 * 64 * 3 * sizeof(float), cudaMemcpyDeviceToHost, stream[idx]));
 
 	}
 	
@@ -261,20 +266,21 @@ void facegen(int num_to_gen, float *network, float *inputs, float *outputs) {
 	CHECK_CUDA(cudaDeviceSynchronize());
 	
 	// recieve output from nodes
-	int offset = 64 * 64 * 3 * per_node_size;
 	if (mpi_rank == 0){
+		int offset = 64 * 64 * 3 * (num_to_gen / mpi_size);
 		float* nodeOutputs = outputs + 64 * 64 * 3 * per_node_size;
-		for (int i = 0; i < mpi_size-1; i++){
-			MPI_Irecv(nodeOutputs + i*offset, offset, MPI_FLOAT, i, tag, MPI_COMM_WORLD, &nodeRequests[i]);
+		for (int i = 1; i < mpi_size; i++){
+			MPI_Irecv(nodeOutputs + (i-1)*offset, offset, MPI_FLOAT, i, tag, MPI_COMM_WORLD, &nodeRequests[i]);
 		}
-		for (int i = 0; i < mpi_size-1; i++){
-			MPI_Wait(&nrequest[i+1], &nstatus[i+1]);
+		for (int i = 1; i < mpi_size; i++){
+			MPI_Wait(&nodeRequests[i], &nodeStatus[i]);
 		}
 	} else {
+		int offset = 64 * 64 * 3 * (num_to_gen / mpi_size);
 		MPI_Isend(outputs, offset, MPI_FLOAT, 0, tag, MPI_COMM_WORLD, &request);
 		MPI_Wait(&request, &status);
 	}
-	
+	MPI_Barrier(MPI_COMM_WORLD);	
 }
 
 void facegen_fin() {
@@ -285,17 +291,19 @@ void facegen_fin() {
    */
 	CHECK_CUDA(cudaFree(gpu_network_full));
 	for (int i = 0; i < 2; i++){
-		CHECK_CUDA(cudaFreeHost(gpu_inputs[i]));
-		CHECK_CUDA(cudaFreeHost(gpu_outputs[i]));
+		CHECK_CUDA(cudaFree(gpu_inputs[i]));
+		CHECK_CUDA(cudaFree(gpu_outputs[i]));
 	}
 
-	for (int i = 0; i < 3; i++){
-		CHECK_CUDA(cudaStreamDestory(stream[i]));
-	}
 
 	CHECK_CUDA(cudaFree(gpu_fm0));
 	CHECK_CUDA(cudaFree(gpu_fm1));
 	CHECK_CUDA(cudaFree(gpu_fm2));
 	CHECK_CUDA(cudaFree(gpu_fm3));
+
+
+	for (int i = 0; i < 3; i++){
+		CHECK_CUDA(cudaStreamDestroy(stream[i]));
+	}
 
 }

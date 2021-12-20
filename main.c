@@ -11,8 +11,8 @@ const int NETWORK_SIZE_IN_BYTES = 20549132;
 int num_to_gen;
 int per_node_size;
 
-int mpi_size;
-int mpi_rank;
+static int mpi_size;
+static int mpi_rank;
 int tag = 0;
 
 // read network binary
@@ -109,6 +109,7 @@ void write_image(char *fn, int num_to_gen, float *outputs) {
 int main(int argc, char **argv) {
     if (argc != 5) {
         fprintf(stderr, "Usage: %s <network binary> <input data> <output data> <output image>\n", argv[0]);
+			per_node_size = num_to_gen / mpi_size;
         fprintf(stderr, " e.g., %s network.bin input1.txt output1.txt output1.bmp\n", argv[0]);
 				exit(EXIT_FAILURE);
 		}
@@ -116,13 +117,12 @@ int main(int argc, char **argv) {
 		MPI_Init(&argc, &argv);
 		MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
 		MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
-
+		
 		float *network, *inputs, *outputs;
 		if (mpi_rank == 0) {
-		
-		network = read_network(argv[1]);
-		inputs = read_inputs(argv[2], &num_to_gen);
-		outputs = (float*)malloc(num_to_gen * 64 * 64 * 3 * sizeof(float));
+			network = read_network(argv[1]);
+			inputs = read_inputs(argv[2], &num_to_gen);
+			outputs = (float*)malloc(num_to_gen * 64 * 64 * 3 * sizeof(float));
 			
 			// send num_to_gen to other nodes
 			for (int i = 1; i < mpi_size; i++) {
@@ -130,24 +130,23 @@ int main(int argc, char **argv) {
 			}
 		
 		} else {
-			per_node_size = num_to_gen / mpi_size;
 			MPI_Recv(&num_to_gen, 1, MPI_INT, 0, tag, MPI_COMM_WORLD, NULL);
+			//per_node_size = num_to_gen / mpi_siz;
 			network = (float*)malloc(NETWORK_SIZE_IN_BYTES);
-			inputs = (float*)malloc(per_node_size * 100 * sizeof(float));
-			outputs = (float*)malloc(per_node_size * 64 * 64 * 3 * sizeof(float));
+			inputs = (float*)malloc(num_to_gen / mpi_size * 100 * sizeof(float));
+			outputs = (float*)malloc(num_to_gen / mpi_size * 64 * 64 * 3 * sizeof(float));
 		}
 		MPI_Barrier(MPI_COMM_WORLD);
 
 		
 		// initialize; does not count into elapsed time
-    printf("Initializing..."); fflush(stdout);
+    printf("Initializing...\n"); fflush(stdout);
     facegen_init();
     printf(" done!\n");
 
     // main calculation
 		if (mpi_rank == 0) {
-    	printf("Calculating..."); 
-			fflush(stdout);
+    	printf("Calculating..."); fflush(stdout);
     	timer_start(0);
 		}
     facegen(num_to_gen, network, inputs, outputs);
@@ -161,14 +160,19 @@ int main(int argc, char **argv) {
 			write_outputs(argv[3], num_to_gen, outputs);
 			write_image(argv[4], num_to_gen, outputs);
 		}
+		MPI_Barrier(MPI_COMM_WORLD);
 
     // finalize; does not count into elapsed time
     printf("Finalizing..."); fflush(stdout);
     facegen_fin();
+		printf("Freed GPU");
     free(network);
+		printf("Freed network");
     free(inputs);
+		printf("Freed inputs");
     free(outputs);
     printf(" done!\n");
+		MPI_Barrier(MPI_COMM_WORLD);
 
     return 0;
 }
