@@ -1,10 +1,11 @@
 #include <cuda_runtime.h>
+#include <mpi.h>
+
 #include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
 
-#include "facegen.h"
-
+#include "facegen.h" 
 
 #define CHECK_CUDA(err)  \
   do { \
@@ -20,42 +21,71 @@
  * TODO
  * Define global variables here.
  */
-static int NETWORK_SIZE_IN_BYTES = 20549132;
+
+extern const int NETWORK_SIZE_IN_BYTES;
 extern int num_to_gen;
+extern int per_node_size;
+extern int tag;
 
 //gpu_mem ptrs for network, inputs, and outputs
 
 static float* gpu_network_full;
-static float* gpu_inputs;  
-static float* gpu_outputs;
+static float* gpu_inputs[2];  
+static float* gpu_outputs[2];
 
 static float* gpu_fm0;
 static float* gpu_fm1;
 static float* gpu_fm2;
 static float* gpu_fm3;
 
-void facegen_init()
-{
+static int mpi_rank; 
+static int mpi_size;
+static MPI_Request request;
+static MPI_Request* nodeRequests;
+static MPI_Status status;
+static MPI_Status* nodeStatus;
+
+static cudaStream_t stream[3];
+
+
+void facegen_init(){
   /*
    * TODO
    * Initialize required CUDA objects. For example,
    * cudaMalloc(...)
    */
-	CHECK_CUDA(cudaMalloc((void **)&gpu_network_full, NETWORK_SIZE_IN_BYTES));
-	CHECK_CUDA(cudaMalloc(&gpu_inputs, num_to_gen * 100 * sizeof(float)));
-	CHECK_CUDA(cudaMalloc(&gpu_outputs, num_to_gen * 64 * 64 * 3 * sizeof(float)));
+	MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+	MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
 
+	int num_of_device;
+	cudaGetDeviceCount(&num_of_device);
+	cudaSetDevice(mpi_rank % num_of_device);
+
+	nodeStatus = (MPI_Status *)malloc(mpi_size * sizeof(MPI_Status));
+	nodeRequests = (MPI_Request *)malloc(mpi_size * sizeof(MPI_Request));
+
+	CHECK_CUDA(cudaMalloc((void **)&gpu_network_full, NETWORK_SIZE_IN_BYTES));
+	// double buffering
+	for (int i = 0; i < 2; i++) {
+		CHECK_CUDA(cudaMallocHost(&gpu_inputs[i], 100 * sizeof(float)));
+		CHECK_CUDA(cudaMallocHost(&gpu_outputs[i], 64 * 64 * 3 * sizeof(float)));
+	}
 	CHECK_CUDA(cudaMalloc(&gpu_fm0, 4 * 4 * 512 * sizeof(float)));
 	CHECK_CUDA(cudaMalloc(&gpu_fm1, 8 * 8 * 256 * sizeof(float)));
 	CHECK_CUDA(cudaMalloc(&gpu_fm2, 16 * 16 * 128 * sizeof(float)));
 	CHECK_CUDA(cudaMalloc(&gpu_fm3, 32 * 32 * 64 * sizeof(float)));
-		
+	
+	// 4 gpus --> 3 + 1 streams
+	for (int i = 0; i < 3; i++){
+		CHECK_CUDA(cudaStreamCreate(&stream[i]));
+		CHECK_CUDA(cudaStreamSynchronize(stream[i]));
+	}
 	CHECK_CUDA(cudaDeviceSynchronize());
+
 }
 
 // data-parallelism w.r.t K (col. dim of output of proj)
-__global__ void proj(float *in, float *out, float *weight, float *bias, int C, int K)
-{
+__global__ void proj(float *in, float *out, float *weight, float *bias, int C, int K){
 	int k = blockDim.x * blockIdx.x + threadIdx.x;
 	if (k >= K) return;
 	
@@ -141,9 +171,23 @@ void facegen(int num_to_gen, float *network, float *inputs, float *outputs) {
    * Device-to-host memory copy
    */
 
+	int offset = 100 * per_node_size;
+	if (mpi_rank == 0){
+		float* nodeInputs = inputs + 100 * per_node_size;
+		for (int i = 0; i < mpi_size-1; i++){
+			MPI_Isend(network, NETWORK_SIZE_IN_BYTES / sizeof(float), MPI_FLOAT, i, tag, MPI_COMM_WORLD, &request);
+			MPI_Isend(nodeInputs + i*offset, offset, MPI_FLOAT, i, tag, MPI_COMM_WORLD, &request);
+			MPI_Wait(&request, &status);
+		}
+	} else {
+		for (int i = 0; i < mpi_size-1; i++){
+			MPI_Irecv(network, NETWORK_SIZE_IN_BYTES / sizeof(float), MPI_FLOAT, 0, tag, MPI_COMM_WORLD, &nodeRequests[i+1]);
+			MPI_Irecv(inputs, offset, MPI_FLOAT, 0, tag, MPI_COMM_WORLD, &nodeRequests[i+1]);
+			MPI_Wait(&nodRequests[i+1], &nodeStatus[i+1]);
+		}
+	}
+
 	CHECK_CUDA(cudaMemcpy(gpu_network_full, network, NETWORK_SIZE_IN_BYTES, cudaMemcpyHostToDevice));
-	CHECK_CUDA(cudaMemcpy(gpu_inputs, inputs, num_to_gen * 100 * sizeof(float), cudaMemcpyHostToDevice));
-	CHECK_CUDA(cudaMemcpy(gpu_outputs, outputs, num_to_gen * 64 * 64 * 3 * sizeof(float), cudaMemcpyHostToDevice));
 	float* gpu_network = gpu_network_full;
 
 	float *proj_w = gpu_network; gpu_network += 100 * 8192;
@@ -175,36 +219,61 @@ void facegen(int num_to_gen, float *network, float *inputs, float *outputs) {
 	
 	/* Add MPI_Send, MPI_Recv here*/ 
 
-	dim3 gridDim(NETWORK_SIZE_IN_BYTES/64);
+	dim3 gridDim(8192);
 	dim3 blockDim(64);
 
-	for (int n = 0; n < num_to_gen; n++){
 		
-		float *input = &gpu_inputs[n * 100];
-		float *output = &gpu_outputs[n * 64 * 64 * 3];
-		proj<<<gridDim, blockDim>>>(input, gpu_fm0, proj_w, proj_b, 100, 8192);
-		batch_norm<<<gridDim, blockDim>>>(gpu_fm0, bn0_beta, bn0_gamma, bn0_mean, bn0_var, 4 * 4, 512);
-		relu<<<gridDim, blockDim>>>(gpu_fm0, 4 * 4 * 512);
+	for (int n = 0; n < per_node_size; n++){
+		
+		// per each buffer
+		int idx = n % 2
+		float *input = &gpu_inputs[idx];
+		float *output = &gpu_outputs[idx];
+		CHECK_CUDA(cudaMemcpyAsync(gpu_inputs[idx], &inputs[n * 100], 100 * sizeof(float), cudaMemcpyHostToDevice, stream[idx]);
 
-		tconv<<<gridDim, blockDim>>>(gpu_fm0, gpu_fm1, tconv1_w, tconv1_b, 4, 4, 512, 256);
-		batch_norm<<<gridDim, blockDim>>>(gpu_fm1, bn1_beta, bn1_gamma, bn1_mean, bn1_var, 8 * 8, 256);
-		relu<<<gridDim, blockDim>>>(gpu_fm1, 8 * 8 * 256);
+		proj<<<gridDim, blockDim, 0, stream[idx]>>>(input, gpu_fm0, proj_w, proj_b, 100, 8192);
+		batch_norm<<<gridDim, blockDim, 0, stream[idx]>>>(gpu_fm0, bn0_beta, bn0_gamma, bn0_mean, bn0_var, 4 * 4, 512);
+		relu<<<gridDim, blockDim, 0, stream[idx]>>>(gpu_fm0, 4 * 4 * 512);
+		
+		tconv<<<gridDim, blockDim, 0, stream[idx]>>>(gpu_fm0, gpu_fm1, tconv1_w, tconv1_b, 4, 4, 512, 256);
+		batch_norm<<<gridDim, blockDim, 0, stream[idx]>>>(gpu_fm1, bn1_beta, bn1_gamma, bn1_mean, bn1_var, 8 * 8, 256);
+		relu<<<gridDim, blockDim, 0, stream[idx]>>>(gpu_fm1, 8 * 8 * 256);
 
-		tconv<<<gridDim, blockDim>>>(gpu_fm1, gpu_fm2, tconv2_w, tconv2_b, 8, 8, 256, 128);
-		batch_norm<<<gridDim, blockDim>>>(gpu_fm2, bn2_beta, bn2_gamma, bn2_mean, bn2_var, 16 * 16, 128);
-		relu<<<gridDim, blockDim>>>(gpu_fm2, 16 * 16 * 128);
+		tconv<<<gridDim, blockDim, 0, stream[idx]>>>(gpu_fm1, gpu_fm2, tconv2_w, tconv2_b, 8, 8, 256, 128);
+		batch_norm<<<gridDim, blockDim, 0, stream[idx]>>>(gpu_fm2, bn2_beta, bn2_gamma, bn2_mean, bn2_var, 16 * 16, 128);
+		relu<<<gridDim, blockDim, 0, stream[idx]>>>(gpu_fm2, 16 * 16 * 128);
 
-		tconv<<<gridDim, blockDim>>>(gpu_fm2, gpu_fm3, tconv3_w, tconv3_b, 16, 16, 128, 64);
-		batch_norm<<<gridDim, blockDim>>>(gpu_fm3, bn3_beta, bn3_gamma, bn3_mean, bn3_var, 32 * 32, 64);
-		relu<<<gridDim, blockDim>>>(gpu_fm3, 32 * 32 * 64);
+		tconv<<<gridDim, blockDim, 0, stream[idx]>>>(gpu_fm2, gpu_fm3, tconv3_w, tconv3_b, 16, 16, 128, 64);
+		batch_norm<<<gridDim, blockDim, 0, stream[idx]>>>(gpu_fm3, bn3_beta, bn3_gamma, bn3_mean, bn3_var, 32 * 32, 64);
+		relu<<<gridDim, blockDim, 0, stream[idx]>>>(gpu_fm3, 32 * 32 * 64);
 
-		tconv<<<gridDim, blockDim>>>(gpu_fm3, output, tconv4_w, tconv4_b, 32, 32, 64, 3);
-		tanh_layer<<<gridDim, blockDim>>>(output, 64 * 64 * 3);
+		tconv<<<gridDim, blockDim, 0, stream[idx]>>>(gpu_fm3, output, tconv4_w, tconv4_b, 32, 32, 64, 3);
+		tanh_layer<<<gridDim, blockDim, 0, stream[idx]>>>(output, 64 * 64 * 3);
 		CHECK_CUDA(cudaDeviceSynchronize());
 
+		CHECK_CUDA(cudaMemcpyAsync(&outputs[n * 64 * 64 * 3], &gpu_outputs[idx], 64 * 64 * 3 * sizeof(float), cudaMemcpyDeviceToHost, stream[idx]));
+
 	}
-	CHECK_CUDA(cudaMemcpy(outputs, gpu_outputs, num_to_gen * 64 * 64 * 3 * sizeof(float), cudaMemcpyDeviceToHost));
+	
+	for (int i = 0; i < 3; i++){
+		CHECK_CUDA(cudaStreamSynchronize(stream[i]));
+	}
 	CHECK_CUDA(cudaDeviceSynchronize());
+	
+	// recieve output from nodes
+	int offset = 64 * 64 * 3 * per_node_size;
+	if (mpi_rank == 0){
+		float* nodeOutputs = outputs + 64 * 64 * 3 * per_node_size;
+		for (int i = 0; i < mpi_size-1; i++){
+			MPI_Irecv(nodeOutputs + i*offset, offset, MPI_FLOAT, i, tag, MPI_COMM_WORLD, &nodeRequests[i]);
+		}
+		for (int i = 0; i < mpi_size-1; i++){
+			MPI_Wait(&nrequest[i+1], &nstatus[i+1]);
+		}
+	} else {
+		MPI_Isend(outputs, offset, MPI_FLOAT, 0, tag, MPI_COMM_WORLD, &request);
+		MPI_Wait(&request, &status);
+	}
 	
 }
 
@@ -215,8 +284,14 @@ void facegen_fin() {
    * cudaFree(...)
    */
 	CHECK_CUDA(cudaFree(gpu_network_full));
-	CHECK_CUDA(cudaFree(gpu_inputs));
-	CHECK_CUDA(cudaFree(gpu_outputs));
+	for (int i = 0; i < 2; i++){
+		CHECK_CUDA(cudaFreeHost(gpu_inputs[i]));
+		CHECK_CUDA(cudaFreeHost(gpu_outputs[i]));
+	}
+
+	for (int i = 0; i < 3; i++){
+		CHECK_CUDA(cudaStreamDestory(stream[i]));
+	}
 
 	CHECK_CUDA(cudaFree(gpu_fm0));
 	CHECK_CUDA(cudaFree(gpu_fm1));
